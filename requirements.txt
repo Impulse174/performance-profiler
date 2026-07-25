@@ -1,0 +1,5 @@
+# Core dependencies
+psutil>=5.9.0
+
+# Optional dependencies for advanced features
+# pympler>=1.0.1  # Для более точного измерения размера объектов
