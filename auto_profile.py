@@ -12,15 +12,22 @@
 При вызове функции автоматически выводится подробная статистика производительности.
 """
 
-import functools
 import inspect
-import asyncio
-from typing import Callable, Dict, Any, Optional
-from performance_inspect import PerformanceProfiler
+from typing import Callable, Dict, Any, Optional, FrozenSet
+
+if __package__:
+    from .performance_inspect import PerformanceProfiler
+else:
+    from performance_inspect import PerformanceProfiler
 
 
 # Глобальный экземпляр профайлера
 _profiler = PerformanceProfiler()
+
+# Имена, которые не подлежат автоматическому профилированию
+_EXCLUDED_FROM_PROFILING: FrozenSet[str] = frozenset({
+    'auto_profile', 'apply_to_all_functions', '_profiler', 'profiler',
+})
 
 
 def auto_profile(func: Callable) -> Callable:
@@ -48,18 +55,11 @@ def auto_profile(func: Callable) -> Callable:
         ...     return 1 if n <= 1 else n * factorial(n-1)
         >>> factorial(100)  # Выведет статистику
     """
-    if asyncio.iscoroutinefunction(func):
-        @functools.wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            profiled_func = _profiler.profile(func)
-            return await profiled_func(*args, **kwargs)
-        return async_wrapper
-    else:
-        @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            profiled_func = _profiler.profile(func)
-            return profiled_func(*args, **kwargs)
-        return sync_wrapper
+    if getattr(func, '_performance_profiled', False):
+        return func
+    wrapped = _profiler.profile(func)
+    wrapped._performance_profiled = True
+    return wrapped
 
 
 def apply_to_all_functions(module_globals: Optional[Dict[str, Any]] = None) -> None:
@@ -74,13 +74,13 @@ def apply_to_all_functions(module_globals: Optional[Dict[str, Any]] = None) -> N
                        Если None, используется globals() вызывающего модуля.
     
     Example:
-        # В начале файла my_module.py:
         from auto_profile import apply_to_all_functions
-        apply_to_all_functions(globals())
-        
-        # Теперь все функции ниже будут профилироваться:
+
         def func1(): ...
         def func2(): ...
+
+        # Применять после определения функций, но до их вызова.
+        apply_to_all_functions(globals())
     """
     if module_globals is None:
         # Пытаемся получить globals() вызывающего фрейма
@@ -102,9 +102,11 @@ def apply_to_all_functions(module_globals: Optional[Dict[str, Any]] = None) -> N
     
     for name, obj in module_globals.items():
         # Пропускаем служебные имена и уже завернутые функции
-        if (name.startswith('_') or 
-            name in ('auto_profile', 'apply_to_all_functions', '_profiler', 'profiler') or
-            not inspect.isfunction(obj)):
+        if (name.startswith('_') or
+            name in _EXCLUDED_FROM_PROFILING or
+            not inspect.isfunction(obj) or
+            obj.__module__ != module_name or
+            getattr(obj, '_performance_profiled', False)):
             continue
         
         functions_to_profile.append(name)
@@ -114,10 +116,12 @@ def apply_to_all_functions(module_globals: Optional[Dict[str, Any]] = None) -> N
         func = module_globals[name]
         module_globals[name] = auto_profile(func)
         _profiler.logger.info(
-            f"[AUTO_PROFILE] Функция '{name}' из модуля '{module_name}' добавлена в профилирование"
+            "[AUTO_PROFILE] Функция '%s' из модуля '%s' добавлена в профилирование",
+            name, module_name,
         )
     
     if functions_to_profile:
         _profiler.logger.info(
-            f"[AUTO_PROFILE] Всего профилируется функций: {len(functions_to_profile)}"
+            "[AUTO_PROFILE] Всего профилируется функций: %d",
+            len(functions_to_profile),
         )

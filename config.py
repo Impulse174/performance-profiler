@@ -4,7 +4,8 @@
 Модуль предоставляет централизованное управление настройками профилирования.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields, replace
+from typing import Any
 
 
 @dataclass
@@ -35,8 +36,11 @@ class ProfilerConfig:
     force_tracemalloc: bool = True
     gc_collect_before: bool = True
     
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Валидация конфигурации после инициализации."""
+        for field in fields(self):
+            if type(getattr(self, field.name)) is not field.type:
+                raise ValueError(f"{field.name} должен быть типа {field.type.__name__}")
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         if self.log_level not in valid_levels:
             raise ValueError(f"log_level должен быть одним из: {valid_levels}")
@@ -59,7 +63,7 @@ def get_config() -> ProfilerConfig:
     return default_config
 
 
-def update_config(**kwargs) -> None:
+def update_config(**kwargs: Any) -> None:
     """
     Обновить конфигурацию.
     
@@ -69,16 +73,14 @@ def update_config(**kwargs) -> None:
     Example:
         update_config(log_level="DEBUG", enable_profiling=False)
     """
-    global default_config
-    
-    for key, value in kwargs.items():
-        if hasattr(default_config, key):
-            setattr(default_config, key, value)
-        else:
+    field_names = {field.name for field in fields(default_config)}
+    for key in kwargs:
+        if key not in field_names:
             raise AttributeError(f"Неизвестный параметр конфигурации: {key}")
+    candidate = replace(default_config, **kwargs)
+    default_config.__dict__.update(asdict(candidate))
 
 
 def reset_config() -> None:
     """Сбросить конфигурацию к значениям по умолчанию."""
-    global default_config
-    default_config = ProfilerConfig()
+    default_config.__dict__.update(asdict(ProfilerConfig()))

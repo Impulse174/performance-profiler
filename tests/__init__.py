@@ -1,1 +1,1 @@
-"""Tests package for performance profiler."""
+"""Пакет тестов профайлера производительности."""

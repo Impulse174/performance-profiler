@@ -23,16 +23,17 @@ import argparse
 import importlib
 import json
 import asyncio
+import reprlib
+import runpy
 from typing import Any, List, Optional, Dict
 from pathlib import Path
 
 # Импортируем профайлер
-from performance_inspect import PerformanceProfiler
+if __package__:
+    from .performance_inspect import PerformanceProfiler
+else:
+    from performance_inspect import PerformanceProfiler
 
-# Конфигурация
-sys.set_int_max_str_digits(100000)  # Лимит для больших int
-CURRENT_DIR = Path(__file__).parent.resolve()
-sys.path.insert(0, str(CURRENT_DIR))
 
 def parse_argument(arg: Any) -> Any:
     """
@@ -87,6 +88,8 @@ def format_result(result: Any, max_length: int = 1000) -> str:
     """
     try:
         if isinstance(result, int):
+            if result.bit_length() > max_length * 4:
+                return f"<int: {result.bit_length()} бит>"
             str_result = str(result)
             if len(str_result) > max_length:
                 return f"<int с {len(str_result)} цифр(ы)>"
@@ -96,18 +99,14 @@ def format_result(result: Any, max_length: int = 1000) -> str:
             return f"<str длиной {len(result)} символов>"
         
         if isinstance(result, (list, dict, set, tuple)):
-            str_result = str(result)
-            if len(str_result) > max_length:
-                size_info = {
-                    list: f"список из {len(result)} элементов",
-                    dict: f"словарь из {len(result)} элементов",
-                    set: f"множество из {len(result)} элементов",
-                    tuple: f"кортеж из {len(result)} элементов"
-                }
-                return f"<{size_info.get(type(result), 'коллекция')}>"
-            return str_result
-        
-        return str(result)
+            if len(result) > max_length:
+                return f"<{type(result).__name__}: {len(result)} элементов>"
+            formatter = reprlib.Repr()
+            formatter.maxstring = formatter.maxother = max_length
+            text = formatter.repr(result)
+        else:
+            text = str(result)
+        return text if len(text) <= max_length else text[:max_length] + "..."
     except Exception:
         return f"<объект {type(result).__name__}>"
 
@@ -117,7 +116,7 @@ def profile_function(
     function_name: str, 
     args: List[str], 
     kwargs_dict: Optional[Dict[str, Any]] = None
-):
+) -> int:
     """
     Профилирование функции из указанного модуля.
     
@@ -126,6 +125,9 @@ def profile_function(
         function_name: Имя функции для профилирования
         args: Позиционные аргументы функции
         kwargs_dict: Словарь именованных аргументов
+
+    Returns:
+        0 при успешном выполнении, 1 при ошибке
     """
     profiler = PerformanceProfiler()
     
@@ -136,16 +138,17 @@ def profile_function(
         # Получение функции
         if not hasattr(module, function_name):
             print(f"❌ Ошибка: Функция '{function_name}' не найдена в модуле '{module_name}'")
-            return
-        
+            return 1
+
         func = getattr(module, function_name)
+        if not callable(func):
+            raise TypeError(f"{module_name}.{function_name} не является вызываемым")
         
         # Парсинг аргументов
         parsed_args = [parse_argument(arg) for arg in args]
-        parsed_kwargs = {}
-        if kwargs_dict:
-            for key, value in kwargs_dict.items():
-                parsed_kwargs[key] = parse_argument(value)
+        parsed_kwargs = {} if kwargs_dict is None else kwargs_dict
+        if not isinstance(parsed_kwargs, dict):
+            raise TypeError("Именованные аргументы должны быть JSON-объектом")
         
         # Инфо о запуске
         print(f"\n{'='*60}")
@@ -158,48 +161,58 @@ def profile_function(
         # Профилирование
         profiled_func = profiler.profile(func)
         
-        if asyncio.iscoroutinefunction(func):
+        if asyncio.iscoroutinefunction(profiled_func):
             print("⏳ Запуск асинхронной функции...")
             result = asyncio.run(profiled_func(*parsed_args, **parsed_kwargs))
         else:
             print("⏳ Запуск синхронной функции...")
             result = profiled_func(*parsed_args, **parsed_kwargs)
         
-        print(f"\n✅ Успешно завершено")
-        print(f"📥 Результат: {format_result(result)}\n")
-        
+        print("\n✅ Успешно завершено")
+        print(f"📥 Результат: {format_result(result, profiler.config.max_result_length)}\n")
+        return 0
+
     except ImportError as e:
         print(f"\n❌ Ошибка импорта модуля '{module_name}': {e}")
-        print(f"💡 Проверьте, что модуль установлен или находится в PYTHONPATH\n")
+        print("💡 Проверьте, что модуль установлен или находится в PYTHONPATH\n")
     except Exception as e:
         print(f"\n❌ Ошибка выполнения: {e}")
-        print(f"💡 Stack trace:")
+        print("💡 Stack trace:")
         import traceback
         traceback.print_exc()
         print()
+    return 1
 
 
-def profile_file(filename: str):
+def profile_file(filename: str) -> int:
     """
     Профилирование выполнения Python файла.
     
     Args:
         filename: Путь к .py файлу (абсолютный или относительный)
+
+    Returns:
+        Код выхода: 0 при успехе, код ошибки иначе
     """
     profiler = PerformanceProfiler()
-    
+    # Сохраняем ссылки на оригинальные объекты и их копии.
+    # original_path/original_argv — те же list-объекты, что и sys.path/sys.argv;
+    # path_values/argv_values — их снимки для восстановления после in-place мутаций.
+    original_path, path_values = sys.path, sys.path[:]
+    original_argv, argv_values = sys.argv, sys.argv[:]
+
     try:
         abs_filename = Path(filename).resolve()
         
-        if not abs_filename.exists():
+        if not abs_filename.is_file():
             print(f"❌ Файл не найден: '{filename}'")
             print(f"   Абсолютный путь: {abs_filename}")
-            return
+            return 1
         
         # Добавляем директорию файла в sys.path
         file_dir = str(abs_filename.parent)
-        if file_dir not in sys.path:
-            sys.path.insert(0, file_dir)
+        sys.path = [file_dir, *sys.path]
+        sys.argv = [str(abs_filename)]
         
         print(f"\n{'='*60}")
         print(f"🚀 Профилирование файла: {filename}")
@@ -207,14 +220,9 @@ def profile_file(filename: str):
         print(f"   Директория: {file_dir}")
         print(f"{'='*60}\n")
         
-        # Чтение файла
-        with open(abs_filename, 'r', encoding='utf-8') as f:
-            code = f.read()
-        
         # Обертка для профилирования
-        def execute_file():
-            exec_globals = {}
-            exec(code, exec_globals)
+        def execute_file() -> str:
+            runpy.run_path(str(abs_filename), run_name="__main__")
             return f"Файл {filename} выполнен"
         
         # Профилирование
@@ -223,19 +231,39 @@ def profile_file(filename: str):
         print("⏳ Выполнение файла...")
         result = profiled_execute()
         
-        print(f"\n✅ Файл выполнен")
+        print("\n✅ Файл выполнен")
         print(f"📥 Результат: {format_result(result)}\n")
-        
+        return 0
+
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        if isinstance(exc.code, int):
+            return exc.code
+        print(exc.code, file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"\n❌ Ошибка выполнения файла: {e}")
-        print(f"💡 Stack trace:")
+        print("💡 Stack trace:")
         import traceback
         traceback.print_exc()
         print()
+        return 1
+    finally:
+        # Восстанавливаем in-place мутации оригинальных списков (если скрипт
+        # делал sys.path.append(...) и т.п.)
+        original_path[:] = path_values
+        original_argv[:] = argv_values
+        # Восстанавливаем ссылки на случай, если скрипт переназначил
+        # sys.path / sys.argv целиком (sys.path = [...])
+        sys.path, sys.argv = original_path, original_argv
 
 
-def main():
+def main(argv: Optional[List[str]] = None) -> int:
     """Точка входа CLI."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(
         description="CLI для профилирования производительности Python функций и скриптов",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -293,28 +321,28 @@ def main():
         help="Именованные аргументы в JSON формате"
     )
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     # Профилирование файла
     if args.file:
-        profile_file(args.file)
-        return
+        if args.module or args.function or args.args or args.kwargs is not None:
+            parser.error("--file нельзя совмещать с целью-функцией или --kwargs")
+        return profile_file(args.file)
     
     # Профилирование функции
     if args.module and args.function:
         kwargs_dict = None
-        if args.kwargs:
+        if args.kwargs is not None:
             try:
                 kwargs_dict = json.loads(args.kwargs)
-            except json.JSONDecodeError as e:
-                print(f"\n❌ Ошибка JSON в --kwargs: {e}\n")
-                return
-        
-        profile_function(args.module, args.function, args.args, kwargs_dict)
-    else:
-        print("\n⚠️  Укажите либо --file, либо MODULE FUNCTION ARGS\n")
-        parser.print_help()
+            except (ValueError, TypeError) as exc:
+                parser.error(f"Некорректный JSON в --kwargs: {exc}")
+            if not isinstance(kwargs_dict, dict):
+                parser.error("--kwargs должен быть JSON-объектом")
+
+        return profile_function(args.module, args.function, args.args, kwargs_dict)
+    parser.error("Укажите либо --file, либо MODULE FUNCTION ARGS")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
